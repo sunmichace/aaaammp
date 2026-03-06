@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef, roc_auc_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pandas as pd
@@ -11,7 +11,6 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 # 图神经网络相关层
 from torch_geometric.nn import SAGEConv, global_mean_pool, GCNConv
-import time
 
 # ===================== 全局配置参数区 =====================
 # 根目录
@@ -21,23 +20,72 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 推理数据集路径
 INFERENCE_CSV_PATH = os.path.join(ROOT_DIR, "mydata/newdata/rawdata_test.csv")
-# 数据集名称，用于输出文件命名
-DATASET_NAME = "val_test"
+# 数据集名称（为空时自动从CSV文件名推断）
+DATASET_NAME = None
 
 # ESM2预训练模型路径
 esm2_backbone_path = os.path.join(ROOT_DIR, "model/esm2_t6_8M_UR50D")
-# ESM2微调后的模型权重路径
-finetuned_esm_path = os.path.join(ROOT_DIR, "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt")
+# ESM2微调后的模型权重候选路径（兼容不同目录结构）
+finetuned_esm_candidates = [
+    os.path.join(ROOT_DIR, "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+    os.path.join(ROOT_DIR, "model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+]
 
-# 四个下游模型的权重路径
-rnn_model_path = r"model/results_ultra_light_rnn/best_rnn_model_no_distill.pt"
-gnn_model_path = r"model/results_ultra_light_gnn/best_model_no_distill_gnn.pt"
-graphsage_model_path = r"model/results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"
-comdel_model_path = r"model/results_ultra_light_scratch/cnn_scratch_best.pt"
+# 四个下游模型的权重候选路径（兼容 `model/` 与项目根目录两种输出）
+rnn_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_rnn/best_rnn_model_no_distill.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_rnn/best_rnn_model_no_distill.pt"),
+]
+gnn_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_gnn/best_model_no_distill_gnn.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_gnn/best_model_no_distill_gnn.pt"),
+]
+graphsage_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"),
+]
+comdel_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_scratch/cnn_scratch_best.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_scratch/cnn_scratch_best.pt"),
+]
 
 # 推理结果保存目录，不存在则自动创建
 OUTPUT_DIR = os.path.join(ROOT_DIR, "single_inference_result_4models")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def resolve_existing_path(path_candidates, file_desc):
+    """按顺序返回第一个存在的路径，否则抛出包含候选路径的错误。"""
+    for candidate in path_candidates:
+        if os.path.exists(candidate):
+            return candidate
+    joined = "\n".join(path_candidates)
+    raise FileNotFoundError(f"{file_desc}不存在，已尝试以下路径:\n{joined}")
+
+
+def extract_state_dict(checkpoint_obj):
+    """
+    兼容常见checkpoint格式：
+    - {"model_state_dict": ...}
+    - {"state_dict": ...}
+    - 直接保存的state_dict
+    """
+    if isinstance(checkpoint_obj, dict) and "model_state_dict" in checkpoint_obj:
+        return checkpoint_obj["model_state_dict"]
+    if isinstance(checkpoint_obj, dict) and "state_dict" in checkpoint_obj:
+        return checkpoint_obj["state_dict"]
+    if isinstance(checkpoint_obj, dict):
+        tensor_keys = [k for k, v in checkpoint_obj.items() if isinstance(v, torch.Tensor)]
+        if tensor_keys:
+            return {k: checkpoint_obj[k] for k in tensor_keys}
+    raise ValueError("无法从checkpoint中解析state_dict")
+
+
+def infer_dataset_name(csv_path, manual_name=None):
+    """优先使用手动名称；为空时用CSV文件名（不含后缀）。"""
+    if manual_name and str(manual_name).strip():
+        return str(manual_name).strip()
+    return os.path.splitext(os.path.basename(csv_path))[0]
 
 # ===================== 数据集构建类 =====================
 class PeptideDataset(Dataset):
@@ -70,6 +118,8 @@ class PeptideFeatureExtractor:
 
     def load_pretrained_model(self, finetuned_model_path=None):
         """加载预训练ESM2模型+微调权重，并冻结所有层，仅用于特征提取"""
+        if finetuned_model_path is None:
+            finetuned_model_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         print(f"\n正在加载特征提取模型: {finetuned_model_path}")
         try:
             # 加载ESM2分词器和主干模型
@@ -97,18 +147,20 @@ class PeptideFeatureExtractor:
 
             # 初始化特征提取模型并部署到指定设备
             self.model = ESM2FeatureExtractor(esm2_backbone).to(self.device)
-            # 校验权重文件是否存在
-            if not os.path.exists(finetuned_model_path):
-                raise FileNotFoundError(f"微调模型文件不存在: {finetuned_model_path}")
             # 加载微调权重文件
             checkpoint = torch.load(finetuned_model_path, map_location=device, weights_only=False)
 
             # 提取模型权重中ESM2主干部分，过滤分类头
-            model_state_dict = checkpoint['model_state_dict']
+            model_state_dict = extract_state_dict(checkpoint)
             feature_extractor_state_dict = {}
             for k, v in model_state_dict.items():
                 if k.startswith('esm2_backbone.'):
                     feature_extractor_state_dict[k] = v
+                elif k.startswith('backbone.'):
+                    mapped_key = k.replace('backbone.', 'esm2_backbone.', 1)
+                    feature_extractor_state_dict[mapped_key] = v
+            if not feature_extractor_state_dict:
+                raise ValueError("ESM2主干权重为空，请检查checkpoint是否匹配当前模型结构")
             # 加载权重，非严格匹配（忽略分类头）
             self.model.load_state_dict(feature_extractor_state_dict, strict=False)
 
@@ -409,28 +461,41 @@ class LightweightCNN(nn.Module):
 # ===================== 工具函数 =====================
 def load_csv_data(csv_path):
     """加载推理数据集，做数据清洗和校验"""
-    if not os.path.exists(csv_path): raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         raise IOError(f"读取CSV失败: {str(e)}")
-    # 校验必要列是否存在
-    required_cols = ['id', 'seq', 'label']
-    if not all(col in df.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in df.columns]
-        raise ValueError(f"CSV缺少必要列: {missing}")
+
+    # 兼容列名：seq/sequence 二选一；id 缺失时自动按行号生成
+    if "seq" in df.columns:
+        seq_col = "seq"
+    elif "sequence" in df.columns:
+        seq_col = "sequence"
+    else:
+        raise ValueError("CSV缺少必要列: ['seq' 或 'sequence']")
+
+    if "label" not in df.columns:
+        raise ValueError("CSV缺少必要列: ['label']")
+
+    if "id" not in df.columns:
+        df = df.copy()
+        df["id"] = np.arange(1, len(df) + 1)
+
     ids, sequences, labels = [], [], []
     # 遍历数据，过滤无效样本
     for _, row in df.iterrows():
-        id_val, seq = row['id'], str(row['seq']).strip().upper()
+        id_val, seq = row["id"], str(row[seq_col]).strip().upper()
         # 过滤空序列
         if len(seq) == 0:
             print(f"过滤空序列（id: {id_val}）")
             continue
         # 过滤无效标签，标签必须是0/1
         try:
-            label = int(row['label'])
-            if label not in (0, 1): raise ValueError(f"标签必须为0或1")
+            label = int(row["label"])
+            if label not in (0, 1):
+                raise ValueError("标签必须为0或1")
         except Exception as e:
             print(f"过滤无效标签（{e}）: {row['label']}（id: {id_val}）")
             continue
@@ -439,16 +504,23 @@ def load_csv_data(csv_path):
         labels.append(label)
     # 数据集基本信息统计
     total, positive = len(labels), sum(labels)
-    print(
-        f"加载完成 {os.path.basename(csv_path)}：共{total}条有效序列（阳性{positive}条，阴性{total - positive}条，阳性占比{positive / total * 100:.2f}%）")
+    if total == 0:
+        raise ValueError(f"数据清洗后无有效样本: {csv_path}")
+    ratio = positive / total * 100
+    print(f"加载完成 {os.path.basename(csv_path)}：共{total}条有效序列（阳性{positive}条，阴性{total - positive}条，阳性占比{ratio:.2f}%）")
     return ids, sequences, labels
 
 def load_trained_models(feat_dim, device):
     """加载4个训练好的分类模型，统一设置为评估模式"""
+    rnn_model_path = resolve_existing_path(rnn_model_candidates, "RNN模型权重")
+    gnn_model_path = resolve_existing_path(gnn_model_candidates, "GNN模型权重")
+    graphsage_model_path = resolve_existing_path(graphsage_model_candidates, "GraphSAGE模型权重")
+    comdel_model_path = resolve_existing_path(comdel_model_candidates, "COMDEL模型权重")
+
     print("\n🔧 加载RNN模型（含标准化器）...")
     rnn_model = EnhancedRNNClassifier(input_dim=feat_dim, hidden_dim=128).to(device)
     rnn_ckpt = torch.load(rnn_model_path, map_location=device, weights_only=False)
-    rnn_model.load_state_dict(rnn_ckpt['model_state_dict'])
+    rnn_model.load_state_dict(extract_state_dict(rnn_ckpt))
     # 初始化标准化器（RNN训练未使用标准化，赋值为默认值不影响推理）
     rnn_scaler = StandardScaler()
     rnn_scaler.mean_ = np.zeros(feat_dim)
@@ -458,23 +530,20 @@ def load_trained_models(feat_dim, device):
     print("\n🔧 加载GNN模型...")
     gnn_model = GNN_EnhancedClassifier(input_dim=feat_dim, hidden_dim=128, num_classes=2, num_layers=2).to(device)
     gnn_ckpt = torch.load(gnn_model_path, map_location=device, weights_only=False)
-    gnn_model.load_state_dict(gnn_ckpt['model_state_dict'])
+    gnn_model.load_state_dict(extract_state_dict(gnn_ckpt))
     gnn_model.eval()
 
     print("\n🔧 加载GraphSAGE模型...")
     graphsage_model = GraphSAGE_Model(input_dim=feat_dim, hidden_dim=128, latent_dim=64).to(device)
     graphsage_ckpt = torch.load(graphsage_model_path, map_location=device, weights_only=False)
-    graphsage_model.load_state_dict(graphsage_ckpt['model_state_dict'])
+    graphsage_model.load_state_dict(extract_state_dict(graphsage_ckpt))
     graphsage_model.eval()
 
     print("\n🔧 加载COMDEL模型（CNN）...")
     comdel_tokenizer = AminoAcidTokenizer(max_seq_len=256)
     comdel_model = LightweightCNN(vocab_size=comdel_tokenizer.vocab_size, embed_dim=128, hidden_dim=128).to(device)
     comdel_ckpt = torch.load(comdel_model_path, map_location=device, weights_only=False)
-    if 'model_state_dict' in comdel_ckpt:
-        comdel_model.load_state_dict(comdel_ckpt['model_state_dict'])
-    else:
-        comdel_model.load_state_dict(comdel_ckpt)
+    comdel_model.load_state_dict(extract_state_dict(comdel_ckpt))
     comdel_model.eval()
 
     return rnn_model, rnn_scaler, gnn_model, graphsage_model, comdel_model, comdel_tokenizer
@@ -482,12 +551,15 @@ def load_trained_models(feat_dim, device):
 # ===================== 核心推理主函数 =====================
 def single_inference():
     """四模型联合推理主流程：数据加载->特征提取->模型推理->结果融合->指标计算->结果保存"""
+    dataset_name = infer_dataset_name(INFERENCE_CSV_PATH, DATASET_NAME)
+
     # 1. 加载数据集
     ids, seqs, labels = load_csv_data(INFERENCE_CSV_PATH)
     true_labels = np.array(labels)
 
     # 2. 初始化特征提取器并加载模型
     extractor = PeptideFeatureExtractor(esm2_backbone_path, device)
+    finetuned_esm_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
     extractor.load_pretrained_model(finetuned_model_path=finetuned_esm_path)
 
     # 3. 批量提取所有序列的CLS特征
@@ -571,16 +643,16 @@ def single_inference():
         "joint_pos_prob": np.round(joint_probs, 4),
         "final_result": ["阳性" if p == 1 else "阴性" for p in joint_preds]
     })
-    result_path = os.path.join(OUTPUT_DIR, f"{DATASET_NAME}_4models_inference_result.csv")
+    result_path = os.path.join(OUTPUT_DIR, f"{dataset_name}_4models_inference_result.csv")
     result_df.to_csv(result_path, index=False, encoding="utf-8-sig")
     print(f"\n📄 推理结果已保存至: {result_path}")
 
     # 定义指标计算函数，计算二分类任务的核心评估指标
     def calculate_metrics(y_true, y_pred):
         acc = accuracy_score(y_true, y_pred)    # 准确率
-        f1 = f1_score(y_true, y_pred)           # F1分数
-        precision = precision_score(y_true, y_pred)  # 精确率
-        recall = recall_score(y_true, y_pred)    # 召回率
+        f1 = f1_score(y_true, y_pred, zero_division=0)           # F1分数
+        precision = precision_score(y_true, y_pred, zero_division=0)  # 精确率
+        recall = recall_score(y_true, y_pred, zero_division=0)    # 召回率
         return acc, f1, precision, recall
 
     # 8. 计算各模型及联合结果的评估指标

@@ -26,13 +26,28 @@ TEST_CSVs = {
     "t3": os.path.join(ROOT_DIR, "test_data/bagel4_3_val.csv")
 }
 
-# 模型路径（保持不变）
+# 模型路径候选（兼容不同目录结构）
 esm2_backbone_path = os.path.join(ROOT_DIR, "model/esm2_t6_8M_UR50D")
-finetuned_esm_path = os.path.join(ROOT_DIR, "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt")
-rnn_model_path = r"model/results_ultra_light_rnn/best_rnn_model_no_distill.pt"
-gnn_model_path = r"model/results_ultra_light_gnn/best_model_no_distill_gnn.pt"
-graphsage_model_path = r"model/results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"
-comdel_model_path = r"model/results_ultra_light_scratch/cnn_scratch_best.pt"
+finetuned_esm_candidates = [
+    os.path.join(ROOT_DIR, "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+    os.path.join(ROOT_DIR, "model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+]
+rnn_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_rnn/best_rnn_model_no_distill.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_rnn/best_rnn_model_no_distill.pt"),
+]
+gnn_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_gnn/best_model_no_distill_gnn.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_gnn/best_model_no_distill_gnn.pt"),
+]
+graphsage_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_graphsage/best_graphsage_model_no_distill.pt"),
+]
+comdel_model_candidates = [
+    os.path.join(ROOT_DIR, "model/results_ultra_light_scratch/cnn_scratch_best.pt"),
+    os.path.join(ROOT_DIR, "results_ultra_light_scratch/cnn_scratch_best.pt"),
+]
 
 # 结果保存目录（优化命名，更直观）
 OUTPUT_DIR = os.path.join(ROOT_DIR, "xgboost_ensemble_result")
@@ -51,6 +66,33 @@ XGB_PARAMS = {
     'seed': 42,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'  # 支持GPU加速
 }
+
+
+def resolve_existing_path(path_candidates, file_desc):
+    """按顺序返回第一个存在的路径，否则抛出包含候选路径的错误。"""
+    for candidate in path_candidates:
+        if os.path.exists(candidate):
+            return candidate
+    joined = "\n".join(path_candidates)
+    raise FileNotFoundError(f"{file_desc}不存在，已尝试以下路径:\n{joined}")
+
+
+def extract_state_dict(checkpoint_obj):
+    """
+    兼容常见checkpoint格式：
+    - {"model_state_dict": ...}
+    - {"state_dict": ...}
+    - 直接保存的state_dict
+    """
+    if isinstance(checkpoint_obj, dict) and "model_state_dict" in checkpoint_obj:
+        return checkpoint_obj["model_state_dict"]
+    if isinstance(checkpoint_obj, dict) and "state_dict" in checkpoint_obj:
+        return checkpoint_obj["state_dict"]
+    if isinstance(checkpoint_obj, dict):
+        tensor_keys = [k for k, v in checkpoint_obj.items() if isinstance(v, torch.Tensor)]
+        if tensor_keys:
+            return {k: checkpoint_obj[k] for k in tensor_keys}
+    raise ValueError("无法从checkpoint中解析state_dict")
 
 # ===================== 原有基础类（保持不变，仅注释优化） =====================
 class PeptideDataset(Dataset):
@@ -78,6 +120,8 @@ class PeptideFeatureExtractor:
 
     def load_pretrained_model(self, finetuned_weight_path):
         """加载微调后的ESM2模型，冻结所有层仅用于特征提取"""
+        if finetuned_weight_path is None:
+            finetuned_weight_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         print(f"\n加载ESM2特征提取模型: {finetuned_weight_path}")
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.esm2_model_path)
@@ -101,7 +145,15 @@ class PeptideFeatureExtractor:
             self.model = ESM2FeatureExtractor(esm2_backbone).to(self.device)
             # 加载微调权重（仅加载ESM2主干部分）
             checkpoint = torch.load(finetuned_weight_path, map_location=device, weights_only=False)
-            state_dict = {k: v for k, v in checkpoint['model_state_dict'].items() if k.startswith('esm2_backbone.')}
+            model_state_dict = extract_state_dict(checkpoint)
+            state_dict = {}
+            for k, v in model_state_dict.items():
+                if k.startswith('esm2_backbone.'):
+                    state_dict[k] = v
+                elif k.startswith('backbone.'):
+                    state_dict[k.replace('backbone.', 'esm2_backbone.', 1)] = v
+            if not state_dict:
+                raise ValueError("ESM2主干权重为空，请检查checkpoint是否匹配当前模型结构")
             self.model.load_state_dict(state_dict, strict=False)
             
             # 冻结参数，加速推理
@@ -289,13 +341,24 @@ def load_csv_data(csv_path):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"文件不存在: {csv_path}")
     df = pd.read_csv(csv_path)
-    required_cols = ['id', 'seq', 'label']
-    if not all(col in df.columns for col in required_cols):
-        raise ValueError(f"缺少列: {[col for col in required_cols if col not in df.columns]}")
+
+    if "seq" in df.columns:
+        seq_col = "seq"
+    elif "sequence" in df.columns:
+        seq_col = "sequence"
+    else:
+        raise ValueError("缺少列: ['seq' 或 'sequence']")
+
+    if "label" not in df.columns:
+        raise ValueError("缺少列: ['label']")
+
+    if "id" not in df.columns:
+        df = df.copy()
+        df["id"] = np.arange(1, len(df) + 1)
     
     ids, seqs, labels = [], [], []
     for _, row in df.iterrows():
-        seq = str(row['seq']).strip().upper()
+        seq = str(row[seq_col]).strip().upper()
         if len(seq) == 0:
             print(f"过滤空序列（id: {row['id']}）")
             continue
@@ -311,15 +374,23 @@ def load_csv_data(csv_path):
         labels.append(label)
     
     total, pos = len(labels), sum(labels)
-    print(f"加载{os.path.basename(csv_path)}: 共{total}条有效序列（阳性{pos}条，占比{pos/total*100:.2f}%）")
+    if total == 0:
+        raise ValueError(f"数据清洗后无有效样本: {csv_path}")
+    ratio = pos / total * 100
+    print(f"加载{os.path.basename(csv_path)}: 共{total}条有效序列（阳性{pos}条，占比{ratio:.2f}%）")
     return ids, seqs, labels
 
 def load_four_models(feat_dim, device):
     """加载四个预训练的下游模型（仅用于生成预测概率）"""
+    rnn_model_path = resolve_existing_path(rnn_model_candidates, "RNN模型权重")
+    gnn_model_path = resolve_existing_path(gnn_model_candidates, "GNN模型权重")
+    graphsage_model_path = resolve_existing_path(graphsage_model_candidates, "GraphSAGE模型权重")
+    comdel_model_path = resolve_existing_path(comdel_model_candidates, "COMDEL模型权重")
+
     # 1. 加载RNN模型
     rnn_model = EnhancedRNNClassifier(input_dim=feat_dim).to(device)
     rnn_ckpt = torch.load(rnn_model_path, map_location=device, weights_only=False)
-    rnn_model.load_state_dict(rnn_ckpt['model_state_dict'])
+    rnn_model.load_state_dict(extract_state_dict(rnn_ckpt))
     rnn_model.eval()
     # 标准化器（无实际作用，仅兼容）
     rnn_scaler = StandardScaler()
@@ -329,20 +400,20 @@ def load_four_models(feat_dim, device):
     # 2. 加载GNN模型
     gnn_model = GNN_EnhancedClassifier(input_dim=feat_dim).to(device)
     gnn_ckpt = torch.load(gnn_model_path, map_location=device, weights_only=False)
-    gnn_model.load_state_dict(gnn_ckpt['model_state_dict'])
+    gnn_model.load_state_dict(extract_state_dict(gnn_ckpt))
     gnn_model.eval()
 
     # 3. 加载GraphSAGE模型
     graphsage_model = GraphSAGE_Model(input_dim=feat_dim).to(device)
     graphsage_ckpt = torch.load(graphsage_model_path, map_location=device, weights_only=False)
-    graphsage_model.load_state_dict(graphsage_ckpt['model_state_dict'])
+    graphsage_model.load_state_dict(extract_state_dict(graphsage_ckpt))
     graphsage_model.eval()
 
     # 4. 加载COMDEL(CNN)模型
     comdel_tokenizer = AminoAcidTokenizer()
     comdel_model = LightweightCNN(vocab_size=len(comdel_tokenizer.vocab)).to(device)
     comdel_ckpt = torch.load(comdel_model_path, map_location=device, weights_only=False)
-    comdel_model.load_state_dict(comdel_ckpt['model_state_dict'] if 'model_state_dict' in comdel_ckpt else comdel_ckpt)
+    comdel_model.load_state_dict(extract_state_dict(comdel_ckpt))
     comdel_model.eval()
 
     return rnn_model, rnn_scaler, gnn_model, graphsage_model, comdel_model, comdel_tokenizer
@@ -424,6 +495,7 @@ def main():
 
     # Step 1: 初始化ESM2特征提取器
     extractor = PeptideFeatureExtractor(esm2_backbone_path, device)
+    finetuned_esm_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
     extractor.load_pretrained_model(finetuned_esm_path)
 
     # Step 2: 加载四个下游模型（用于生成概率特征）
@@ -438,6 +510,8 @@ def main():
     feature_cols = ["rnn_pos_prob", "gnn_pos_prob", "graphsage_pos_prob", "comdel_pos_prob"]
     X_train = train_feat_df[feature_cols].values
     y_train = train_feat_df["true_label"].values
+    if len(np.unique(y_train)) < 2:
+        raise ValueError("训练集仅包含单一类别，无法训练二分类XGBoost模型")
     
     # 训练XGBoost
     print("\n训练XGBoost模型...")
@@ -464,9 +538,9 @@ def main():
         
         # 计算评估指标
         acc = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
         try:
             auc = roc_auc_score(y_test, y_pred_prob)
         except:
@@ -491,7 +565,7 @@ def main():
     print("\n========== 训练集XGBoost表现 ==========")
     y_train_pred = (xgb_model.predict_proba(X_train)[:, 1] >= 0.5).astype(int)
     train_acc = accuracy_score(y_train, y_train_pred)
-    train_f1 = f1_score(y_train, y_train_pred)
+    train_f1 = f1_score(y_train, y_train_pred, zero_division=0)
     print(f"训练集 - 准确率: {train_acc:.4f} | F1分数: {train_f1:.4f}")
 
     print("\n🎉 所有流程完成！结果保存在: xgboost_ensemble_result 目录")

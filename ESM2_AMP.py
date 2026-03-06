@@ -25,6 +25,24 @@ torch.serialization.add_safe_globals([LabelEncoder])
 plt.rcParams["axes.unicode_minus"] = False
 
 
+def extract_state_dict(checkpoint_obj):
+    """
+    兼容常见checkpoint格式:
+    - {"model_state_dict": ...}
+    - {"state_dict": ...}
+    - 直接保存的state_dict
+    """
+    if isinstance(checkpoint_obj, dict) and "model_state_dict" in checkpoint_obj:
+        return checkpoint_obj["model_state_dict"]
+    if isinstance(checkpoint_obj, dict) and "state_dict" in checkpoint_obj:
+        return checkpoint_obj["state_dict"]
+    if isinstance(checkpoint_obj, dict):
+        tensor_keys = [k for k, v in checkpoint_obj.items() if isinstance(v, torch.Tensor)]
+        if tensor_keys:
+            return {k: checkpoint_obj[k] for k in tensor_keys}
+    raise ValueError("无法从checkpoint中解析state_dict")
+
+
 # ===================== 自定义数据集类 =====================
 class PeptideDataset(Dataset):
     """
@@ -381,7 +399,7 @@ class PeptidePredictor:
         )
 
         # 早停策略初始化：保存验证集最优F1的模型
-        best_val_f1 = 0.0
+        best_val_f1 = -1.0
         early_stop_count = 0
 
         # 开始训练循环
@@ -467,7 +485,7 @@ class PeptidePredictor:
         print(f"--- Evaluating Fold {fold_num} best model on Test Set ---")
         best_model_path = os.path.join(fold_save_dir, "esm2_8m_binary_best.pt")
         checkpoint = torch.load(best_model_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(extract_state_dict(checkpoint))
 
         # 绘制并保存所有训练相关的曲线
         self._plot_loss_curve(fold_save_dir)
@@ -572,7 +590,7 @@ class PeptidePredictor:
         if model_path:
             print(f"加载ESM2 8M模型: {model_path}")
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.load_state_dict(extract_state_dict(checkpoint))
         self.model.eval()
         predictions = []
         probabilities = []
@@ -681,7 +699,7 @@ class PeptidePredictor:
         """
         if not self.all_folds_metrics:
             print("没有可用的模型指标，无法选择最佳模型。")
-            return
+            return None
 
         df_metrics = pd.DataFrame(self.all_folds_metrics)
         # 按F1降序、MCC降序排序
@@ -693,6 +711,8 @@ class PeptidePredictor:
         best_mcc = best_model_info['mcc']
         best_accuracy = best_model_info['accuracy']
         best_model_path = best_model_info['model_path']
+        if not os.path.exists(best_model_path):
+            raise FileNotFoundError(f"最佳模型文件不存在: {best_model_path}")
 
         # 创建最优模型保存目录
         best_model_dir = os.path.join(save_dir, "best_model_amp")
@@ -749,16 +769,23 @@ def load_csv_data(csv_path):
         df = pd.read_csv(csv_path)
     except Exception as e:
         raise IOError(f"读取CSV失败: {str(e)}")
-    # 校验必要列是否存在
-    required_cols = ['id', 'seq', 'label']
-    if not all(col in df.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in df.columns]
-        raise ValueError(f"CSV缺少必要列: {missing}")
+    if "seq" in df.columns:
+        seq_col = "seq"
+    elif "sequence" in df.columns:
+        seq_col = "sequence"
+    else:
+        raise ValueError("CSV缺少必要列: ['seq' 或 'sequence']")
+    if "label" not in df.columns:
+        raise ValueError("CSV缺少必要列: ['label']")
+    if "id" not in df.columns:
+        df = df.copy()
+        df["id"] = np.arange(1, len(df) + 1)
+
     ids, sequences, labels = [], [], []
     # 逐行读取并清洗数据
     for _, row in df.iterrows():
         id_val = row['id']
-        seq = str(row['seq']).strip().upper()  # 序列转大写，去除首尾空格
+        seq = str(row[seq_col]).strip().upper()  # 序列转大写，去除首尾空格
         if len(seq) == 0:
             print(f"过滤空序列（id: {id_val}）")
             continue
@@ -773,6 +800,8 @@ def load_csv_data(csv_path):
         ids.append(id_val)
         sequences.append(seq)
         labels.append(label)
+    if len(sequences) == 0:
+        raise ValueError(f"数据清洗后无有效样本: {csv_path}")
     print(f"从 {os.path.basename(csv_path)} 加载完成：共{len(sequences)}条有效序列（阳性{sum(labels)}条）")
     return ids, sequences, labels
 
@@ -858,5 +887,8 @@ if __name__ == "__main__":
 
     # 打印最终结果保存路径
     print(f"\n所有模型和指标文件已保存至: {save_metrics_dir}")
-    print(f"最佳模型已保存至: {best_model_path}")
-    print(f"最佳模型说明文件: {os.path.join(os.path.dirname(best_model_path), 'best_model_info.txt')}")
+    if best_model_path is None:
+        print("未选出最佳模型：请检查各折训练是否成功生成有效指标。")
+    else:
+        print(f"最佳模型已保存至: {best_model_path}")
+        print(f"最佳模型说明文件: {os.path.join(os.path.dirname(best_model_path), 'best_model_info.txt')}")

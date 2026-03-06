@@ -42,12 +42,14 @@ t3_csv = os.path.join(ROOT_DIR, "test_data/bagel4_3_val.csv")  # 测试集t3
 
 # ESM2预训练模型和微调ESM模型路径
 esm2_backbone_path = os.path.join(ROOT_DIR, "model/esm2_t6_8M_UR50D")  # ESM2 8M backbone路径
-finetuned_esm_path = os.path.join(ROOT_DIR,
-                                  "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt")  # 微调后的ESM模型权重
+finetuned_esm_candidates = [
+    os.path.join(ROOT_DIR, "model/model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+    os.path.join(ROOT_DIR, "model_AMP_ESM2_8M_256_v3/best_model_amp/esm2_8m_binary_best.pt"),
+]
 
 # 各数据集预测结果输出路径
 val0_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/val0_val_test_early_stop_predictions.csv")
-t0_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/t0_rawdata_val_predictions.csv")
+t0_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/t0_rawdata_test_predictions.csv")
 t1_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/t1_bagel4_1_val_predictions.csv")
 t2_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/t2_bagel4_2_val_predictions.csv")
 t3_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/t3_bagel4_3_val_predictions.csv")
@@ -55,6 +57,48 @@ metrics_summary_output = os.path.join(ROOT_DIR, "results_ultra_light_gnn/metrics
 
 # 设备选择：优先使用GPU(cuda)，无GPU则使用CPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def resolve_existing_path(path_candidates, file_desc):
+    """按顺序返回第一个存在路径，不存在则抛出异常。"""
+    for candidate in path_candidates:
+        if os.path.exists(candidate):
+            return candidate
+    joined = "\n".join(path_candidates)
+    raise FileNotFoundError(f"{file_desc}不存在，已尝试以下路径:\n{joined}")
+
+
+def extract_state_dict(checkpoint_obj):
+    """
+    兼容常见checkpoint格式:
+    - {"model_state_dict": ...}
+    - {"state_dict": ...}
+    - 直接保存的state_dict
+    """
+    if isinstance(checkpoint_obj, dict) and "model_state_dict" in checkpoint_obj:
+        return checkpoint_obj["model_state_dict"]
+    if isinstance(checkpoint_obj, dict) and "state_dict" in checkpoint_obj:
+        return checkpoint_obj["state_dict"]
+    if isinstance(checkpoint_obj, dict):
+        tensor_keys = [k for k, v in checkpoint_obj.items() if isinstance(v, torch.Tensor)]
+        if tensor_keys:
+            return {k: checkpoint_obj[k] for k in tensor_keys}
+    raise ValueError("无法从checkpoint中解析state_dict")
+
+
+def extract_esm_backbone_state_dict(checkpoint_obj):
+    """从checkpoint中提取ESM backbone权重，兼容不同前缀。"""
+    raw_state = extract_state_dict(checkpoint_obj)
+    backbone_state = {}
+    for k, v in raw_state.items():
+        if k.startswith("esm2_backbone."):
+            backbone_state[k] = v
+        elif k.startswith("backbone."):
+            mapped_key = k.replace("backbone.", "esm2_backbone.", 1)
+            backbone_state[mapped_key] = v
+    if not backbone_state:
+        raise ValueError("checkpoint中未找到ESM2 backbone权重")
+    return backbone_state
 
 
 # ===================== 自定义数据集类 =====================
@@ -114,6 +158,8 @@ class PeptideFeatureExtractor:
         加载预训练的ESM2模型+微调后的权重，并构建特征提取器
         :param finetuned_model_path: 微调后的ESM模型权重路径
         """
+        if finetuned_model_path is None:
+            finetuned_model_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         print(f"\n正在加载特征提取模型: {finetuned_model_path}")
         try:
             # 加载ESM2分词器和骨干模型
@@ -139,18 +185,11 @@ class PeptideFeatureExtractor:
 
             # 实例化特征提取模型并部署到指定设备
             self.model = ESM2FeatureExtractor(esm2_backbone).to(self.device)
-            # 校验权重文件是否存在
-            if not os.path.exists(finetuned_model_path):
-                raise FileNotFoundError(f"微调模型文件不存在: {finetuned_model_path}")
             # 加载微调后的权重
             checkpoint = torch.load(finetuned_model_path, map_location=self.device, weights_only=False)
 
             # 提取骨干模型权重（过滤分类头权重）
-            model_state_dict = checkpoint['model_state_dict']
-            feature_extractor_state_dict = {}
-            for k, v in model_state_dict.items():
-                if k.startswith('esm2_backbone.'):
-                    feature_extractor_state_dict[k] = v
+            feature_extractor_state_dict = extract_esm_backbone_state_dict(checkpoint)
             self.model.load_state_dict(feature_extractor_state_dict, strict=False)
 
             # 冻结所有层：特征提取阶段不训练，仅做推理
@@ -233,6 +272,7 @@ class PeptideFeatureExtractor:
 
         # 实例化临时预测器并加载权重
         temp_predictor = PeptidePredictor(self.esm2_model_name_or_path, self.device)
+        finetuned_esm_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         temp_predictor.load_pretrained_model(freeze_layers=True, finetuned_model_path=finetuned_esm_path)
         predictions, probabilities, inference_time = temp_predictor.predict(sequences, batch_size)
         return predictions, probabilities, inference_time
@@ -263,6 +303,8 @@ class PeptidePredictor:
         :param freeze_layers: 是否冻结骨干层
         :param finetuned_model_path: 微调权重路径
         """
+        if finetuned_model_path is None:
+            finetuned_model_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         print(f"\n加载临时预测模型: {finetuned_model_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.esm2_model_name_or_path)
         esm2_backbone = AutoModel.from_pretrained(self.esm2_model_name_or_path)
@@ -303,7 +345,7 @@ class PeptidePredictor:
         # 加载模型和权重
         self.model = ESM2Classifier(esm2_backbone).to(self.device)
         checkpoint = torch.load(finetuned_model_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(extract_state_dict(checkpoint))
         # 推理阶段冻结所有参数
         for param in self.model.parameters():
             param.requires_grad = False
@@ -355,30 +397,38 @@ def load_csv_data(csv_path):
     :return: 清洗后的id列表、序列列表、标签列表
     """
     # 校验文件是否存在
-    if not os.path.exists(csv_path): raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         raise IOError(f"读取CSV失败: {str(e)}")
 
-    # 校验必要列是否存在
-    required_cols = ['id', 'seq', 'label']
-    if not all(col in df.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in df.columns]
-        raise ValueError(f"CSV缺少必要列: {missing}")
+    if "seq" in df.columns:
+        seq_col = "seq"
+    elif "sequence" in df.columns:
+        seq_col = "sequence"
+    else:
+        raise ValueError("CSV缺少必要列: ['seq' 或 'sequence']")
+    if "label" not in df.columns:
+        raise ValueError("CSV缺少必要列: ['label']")
+    if "id" not in df.columns:
+        df = df.copy()
+        df["id"] = np.arange(1, len(df) + 1)
 
     ids, sequences, labels = [], [], []
     # 逐行读取并清洗数据
     for _, row in df.iterrows():
-        id_val, seq = row['id'], str(row['seq']).strip().upper()  # 序列去空格+转大写
+        id_val, seq = row["id"], str(row[seq_col]).strip().upper()  # 序列去空格+转大写
         # 过滤空序列
         if len(seq) == 0:
             print(f"过滤空序列（id: {id_val}）")
             continue
         # 过滤无效标签，仅保留0/1
         try:
-            label = int(row['label'])
-            if label not in (0, 1): raise ValueError(f"标签必须为0或1")
+            label = int(row["label"])
+            if label not in (0, 1):
+                raise ValueError("标签必须为0或1")
         except Exception as e:
             print(f"过滤无效标签（{e}）: {row['label']}（id: {id_val}）")
             continue
@@ -388,8 +438,10 @@ def load_csv_data(csv_path):
 
     # 输出数据统计信息
     total, positive = len(labels), sum(labels)
-    print(
-        f"加载完成 {os.path.basename(csv_path)}：共{total}条有效序列（阳性{positive}条，阴性{total - positive}条，阳性占比{positive / total * 100:.2f}%）")
+    if total == 0:
+        raise ValueError(f"数据清洗后无有效样本: {csv_path}")
+    ratio = positive / total * 100
+    print(f"加载完成 {os.path.basename(csv_path)}：共{total}条有效序列（阳性{positive}条，阴性{total - positive}条，阳性占比{ratio:.2f}%）")
     return ids, sequences, labels
 
 
@@ -651,7 +703,7 @@ class StandardGNNTrainer:
         # 定义优化器和损失函数
         self.optimizer = optim.AdamW(self.gnn_model.parameters(), lr=lr, weight_decay=1e-4)
         criterion = nn.CrossEntropyLoss()
-        best_val_f1, early_stop_count = 0.0, 0  # 早停相关初始化
+        best_val_f1, early_stop_count = -1.0, 0  # 早停相关初始化
 
         print(f"\n开始训练GNN模型（无蒸馏）...")
         print(f"超参数配置: 批大小={batch_size}, 轮次={epochs}, 学习率={lr}")
@@ -961,7 +1013,7 @@ def train_gnn_no_distillation():
         print(f"\n数据集汇总: ")
         print(f"   - 训练集: {len(train_sequences)}条")
         print(f"   - 验证集(val_test): {len(val0_sequences)}条")
-        print(f"   - 测试集t0(rawdata_val): {len(t0_sequences)}条")
+        print(f"   - 测试集t0(rawdata_test): {len(t0_sequences)}条")
         print(f"   - 测试集t1(bagel4_1_val): {len(t1_sequences)}条")
         print(f"   - 测试集t2(bagel4_2_val): {len(t2_sequences)}条")
         print(f"   - 测试集t3(bagel4_3_val): {len(t3_sequences)}条")
@@ -969,6 +1021,7 @@ def train_gnn_no_distillation():
         # 2. 加载ESM2特征提取器
         print("\n===================== 加载特征提取模型 =====================")
         feature_extractor = PeptideFeatureExtractor(esm2_model_name_or_path=esm2_backbone_path, device=device)
+        finetuned_esm_path = resolve_existing_path(finetuned_esm_candidates, "ESM2微调权重")
         feature_extractor.load_pretrained_model(finetuned_model_path=finetuned_esm_path)
 
         # 3. 初始化GNN模型
@@ -1013,7 +1066,7 @@ def train_gnn_no_distillation():
 
         t0_perf = trainer.evaluate_model_performance(
             sequences=t0_sequences, labels=t0_labels, ids=t0_ids,
-            batch_size=64, dataset_name="t0_rawdata_val_gnn"
+            batch_size=64, dataset_name="t0_rawdata_test_gnn"
         )
 
         t1_perf = trainer.evaluate_model_performance(
