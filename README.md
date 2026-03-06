@@ -1,4 +1,4 @@
-# AAAAMMP Pipeline
+# AMPeLM Pipeline
 
 This repository contains a peptide classification pipeline built around an ESM2 feature extractor and four downstream models.
 
